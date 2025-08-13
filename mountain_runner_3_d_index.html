@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mountain Runner 3D</title>
+  <style>
+    :root{
+      --bg:#0b1022; --panel:#0f172a; --ink:#e5e7eb; --muted:#9aa7c3; --accent:#60a5fa;
+      --win:#16a34a; --lose:#ef4444; --gold:#fbbf24;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;}
+    body{margin:0; background:radial-gradient(1200px 800px at -20% -20%, #182148 0%, var(--bg) 65%), var(--bg); color:var(--ink); font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
+    #game{position:relative; width:100%; height:100vh; overflow:hidden}
+    #hud{position:absolute; top:12px; left:12px; display:flex; gap:10px; z-index:10}
+    .chip{background:rgba(15,23,42,.8); border:1px solid rgba(148,163,184,.25); padding:8px 12px; border-radius:12px; font-weight:600}
+    #speed::after{content:' m/s'}
+    #centerMsg{position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:rgba(15,23,42,.9); border:1px solid rgba(148,163,184,.35); border-radius:16px; padding:18px; width:min(520px, 92vw); z-index:20; box-shadow:0 20px 60px rgba(0,0,0,.4)}
+    #centerMsg h1{margin:0 0 6px; font-size:22px}
+    #centerMsg input{width:100%; padding:12px 12px; border-radius:12px; border:1px solid rgba(148,163,184,.3); background:#0b1534; color:var(--ink)}
+    #centerMsg button{margin-top:10px; width:100%; padding:12px; border-radius:12px; border:0; background:#1f2e66; color:var(--ink); cursor:pointer}
+    #centerMsg small{opacity:.7}
+    #leader{margin-top:12px; background:#0b1534; border:1px solid rgba(148,163,184,.25); border-radius:12px; padding:10px; max-height:180px; overflow:auto;}
+    #banner{position:absolute; right:12px; top:12px; z-index:10; background:rgba(15,23,42,.8); border:1px solid rgba(148,163,184,.25); padding:10px 12px; border-radius:12px}
+    #controls{position:absolute; bottom:14px; left:50%; transform:translateX(-50%); display:flex; gap:8px; z-index:10}
+    #controls button{padding:12px 14px; border-radius:12px; border:1px solid rgba(148,163,184,.25); background:#0b1534; color:var(--ink)}
+    canvas{display:block}
+  </style>
+</head>
+<body>
+  <div id="game">
+    <div id="hud">
+      <div class="chip">🏆 Score: <span id="score">0</span></div>
+      <div class="chip">🪙 Coins: <span id="coins">0</span></div>
+      <div class="chip">⚡ Speed: <span id="speed">8</span></div>
+      <div class="chip">📏 Dist: <span id="dist">0</span> m</div>
+    </div>
+    <div id="banner">⛰️ Mountain Runner 3D</div>
+
+    <div id="centerMsg">
+      <h1>⛰️ Mountain Runner 3D</h1>
+      <p style="margin:0 0 8px">Outrun the yeti on snowy ridges. Dodge, jump, duck, and collect coins. Name required for leaderboard.</p>
+      <input id="playerName" placeholder="Enter your name" maxlength="20" />
+      <button id="startBtn">Start Run</button>
+      <div id="leader"><b>🏆 Leaderboard</b><div id="lbList" style="margin-top:6px; font-family:ui-monospace,Consolas,monospace; font-size:14px">Loading…</div></div>
+      <small>Controls: A/D or ◀▶ lane • W/▲/Space jump • S/▼ duck/roll • P pause</small>
+    </div>
+
+    <div id="controls">
+      <button onclick="tryMove(1)">◀</button>
+      <button onclick="tryJump()">⤴ Jump</button>
+      <button onclick="tryDuck()">⬇ Duck</button>
+      <button onclick="tryMove(-1)">▶</button>
+    </div>
+  </div>
+
+  <!-- Three.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+  <script>
+  // ======= Config =======
+  const LANES = [-3, 0, 3]; // x positions
+  const GRAVITY = -36;      // m/s^2 scaled
+  const JUMP_V = 16;        // initial jump velocity
+  const BASE_SPEED = 8;     // forward m/s
+  const MAX_SPEED = 28;     // cap
+  const SPEED_RAMP = 0.015; // per second
+  const COIN_VALUE = 10;
+  const API = 'api.php';    // adjust path if needed
+
+  // ======= State =======
+  let renderer, scene, camera, clock;
+  let player, playerBB, playerLane=1, vy=0, duckT=0, rollT=0;
+  let ground, mountains = [];
+  let obstacles = [], coins = [];
+  let speed = BASE_SPEED, distance=0, score=0, coinCount=0;
+  let alive = false, paused = false;
+  let yeti, yetiDist = 15; // behind player
+  let spawnZ = 60; // where new items spawn
+
+  // HUD
+  const elScore = document.getElementById('score');
+  const elCoins = document.getElementById('coins');
+  const elSpeed = document.getElementById('speed');
+  const elDist  = document.getElementById('dist');
+  const startBtn = document.getElementById('startBtn');
+
+  // Leaderboard
+  const nameInput = document.getElementById('playerName');
+  const lbList = document.getElementById('lbList');
+
+  startBtn.addEventListener('click', () => {
+    const nm = (nameInput.value||'').trim();
+    if (!nm) { nameInput.focus(); nameInput.style.borderColor = '#ef4444'; return; }
+    document.getElementById('centerMsg').style.display='none';
+    begin();
+  });
+
+  // ======= Init 3D =======
+  function init(){
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(devicePixelRatio);
+    document.getElementById('game').appendChild(renderer.domElement);
+
+    scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x0b1022, 40, 160);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 4, -10);
+
+    // Lights
+    const amb = new THREE.AmbientLight(0xffffff, 0.6); scene.add(amb);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9); dir.position.set(5,10,-5); scene.add(dir);
+
+    // Ground (long strip that scrolls)
+    const groundGeo = new THREE.PlaneGeometry(12, 400, 1, 20);
+    const groundMat = new THREE.MeshStandardMaterial({color:0x203154, roughness:0.9, metalness:0});
+    ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI/2;
+    ground.position.z = 100; // center farther ahead
+    scene.add(ground);
+
+    // Mountains: repeating low-poly cones on sides
+    const mGeo = new THREE.ConeGeometry(6, 16, 6);
+    const mMat = new THREE.MeshStandardMaterial({color:0x2a3c6b, roughness:1.0});
+    for (let i=0;i<20;i++){
+      const m1 = new THREE.Mesh(mGeo, mMat.clone());
+      m1.position.set(-10 + Math.random()*-12, 8, Math.random()*200);
+      m1.rotation.x = (Math.random()*0.3);
+      m1.scale.setScalar(0.8 + Math.random()*1.2);
+      scene.add(m1); mountains.push(m1);
+      const m2 = m1.clone(); m2.position.x = 10 + Math.random()*12; scene.add(m2); mountains.push(m2);
+    }
+
+    // Player (capsule-like box)
+    const body = new THREE.BoxGeometry(1.2, 2.0, 1.0);
+    const mat = new THREE.MeshStandardMaterial({color:0x60a5fa});
+    player = new THREE.Mesh(body, mat);
+    player.position.set(LANES[playerLane], 1.0, -2);
+    scene.add(player);
+    playerBB = new THREE.Box3();
+
+    // Yeti (placeholder big prism)
+    const yGeo = new THREE.ConeGeometry(1.4, 3.0, 4);
+    const yMat = new THREE.MeshStandardMaterial({color:0xffffff});
+    yeti = new THREE.Mesh(yGeo, yMat);
+    yeti.rotation.x = Math.PI; // upside down cone looks like creature head
+    scene.add(yeti);
+
+    clock = new THREE.Clock();
+
+    window.addEventListener('resize', onResize);
+    window.addEventListener('keydown', onKey);
+
+    // Touch/swipe
+    initTouch();
+
+    loadTop();
+    render();
+  }
+
+  function onResize(){
+    camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  // ======= Game Control =======
+  function begin(){
+    resetGame();
+    alive = true; paused = false;
+    clock.getDelta(); // flush
+    animate();
+  }
+
+  function endGame(){
+    alive = false; paused = true;
+    submitTop((nameInput.value||'Player').trim(), Math.round(score), Math.round(distance));
+    document.getElementById('centerMsg').style.display='block';
+    startBtn.textContent = 'Restart Run';
+    loadTop();
+  }
+
+  function resetGame(){
+    // Clear items
+    obstacles.forEach(o=>scene.remove(o.mesh)); obstacles=[];
+    coins.forEach(c=>scene.remove(c.mesh)); coins=[];
+
+    playerLane=1; vy=0; duckT=0; rollT=0; speed=BASE_SPEED; distance=0; score=0; coinCount=0; yetiDist=15; spawnZ=60;
+    player.position.set(LANES[playerLane], 1.0, -2);
+  }
+
+  // ======= Loop =======
+  function animate(){
+    if (!alive) return;
+    const dt = Math.min(0.033, clock.getDelta());
+    if (!paused){
+      // Speed ramp
+      speed = Math.min(MAX_SPEED, speed + SPEED_RAMP*dt*60);
+      distance += speed*dt; score += speed*dt * 5; // running gives points
+
+      // Lane smoothing toward target x (snap instantly for simplicity here)
+      const targetX = LANES[playerLane];
+      player.position.x += (targetX - player.position.x) * Math.min(1, dt*12);
+
+      // Jump / gravity
+      if (player.position.y > 1.0 || vy>0){
+        vy += GRAVITY*dt; player.position.y += vy*dt; if (player.position.y <= 1.0){ player.position.y=1.0; vy=0; }
+      }
+
+      // Duck/Roll timers
+      if (duckT>0) duckT -= dt; if (rollT>0) rollT -= dt;
+      const scaleY = (duckT>0? 0.55 : (rollT>0? 0.75 : 1.0));
+      player.scale.y += (scaleY - player.scale.y)*Math.min(1, dt*15);
+
+      // Move world objects toward player (negative Z)
+      ground.position.z -= speed*dt; if (ground.position.z < -100){ ground.position.z += 200; }
+      mountains.forEach(m=>{ m.position.z -= speed*dt*0.6; if (m.position.z < -20) m.position.z += 200; });
+
+      // Spawn logic
+      spawnZ -= speed*dt;
+      while (spawnZ < 80){
+        spawnRow(spawnZ + 200);
+        spawnZ += 20 + Math.random()*8;
+      }
+
+      // Update obstacles/coins
+      updateObjects(dt);
+
+      // Yeti follows (gets closer on hits in future)
+      const yz = player.position.z - yetiDist;
+      yeti.position.set(player.position.x*0.7, 1.6, yz);
+      if (yetiDist < 5){ endGame(); }
+
+      // Camera follows behind player
+      camera.position.lerp(new THREE.Vector3(player.position.x*0.5, 4.0, player.position.z - 10), 0.08);
+      camera.lookAt(player.position.x, player.position.y+0.5, player.position.z+10);
+
+      // HUD
+      elScore.textContent = Math.round(score);
+      elCoins.textContent = coinCount;
+      elSpeed.textContent = speed.toFixed(1);
+      elDist.textContent  = Math.round(distance);
+    }
+    render();
+    requestAnimationFrame(animate);
+  }
+
+  function render(){ renderer.render(scene, camera); }
+
+  // ======= Objects =======
+  function spawnRow(z){
+    // Random: obstacles or coins per lane
+    const pattern = Math.random();
+    for (let lane=0; lane<3; lane++){
+      const x = LANES[lane];
+      if (pattern < 0.55){
+        // obstacle types
+        const r = Math.random();
+        if (r < 0.33) spawnObstacle(x, 1.0, z, 'low');      // need jump
+        else if (r < 0.66) spawnObstacle(x, 2.0, z, 'high'); // need duck
+        else spawnObstacle(x, 2.0, z, 'bar');                // solid fence
+      } else {
+        // coins
+        const count = 1 + Math.floor(Math.random()*3);
+        for (let i=0;i<count;i++) spawnCoin(x, z + i*2);
+      }
+    }
+  }
+
+  function spawnObstacle(x, h, z, type){
+    const geo = new THREE.BoxGeometry(1.3, h, 1.3);
+    const mat = new THREE.MeshStandardMaterial({color: type==='bar'?0xff6b6b:0xf59e0b});
+    const mesh = new THREE.Mesh(geo, mat); mesh.position.set(x, h/2, z);
+    scene.add(mesh);
+    obstacles.push({mesh, type, bb:new THREE.Box3()});
+  }
+  function spawnCoin(x, z){
+    const geo = new THREE.CylinderGeometry(0.5, 0.5, 0.12, 18);
+    const mat = new THREE.MeshStandardMaterial({color:0xfbbf24, emissive:0x332200, emissiveIntensity:0.4});
+    const mesh = new THREE.Mesh(geo, mat); mesh.rotation.z = Math.PI/2; mesh.position.set(x, 1.2, z);
+    scene.add(mesh);
+    coins.push({mesh, bb:new THREE.Box3(), t:Math.random()*Math.PI*2});
+  }
+
+  function updateObjects(dt){
+    // move and check collisions
+    playerBB.setFromObject(player);
+
+    // obstacles
+    for (let i=obstacles.length-1;i>=0;i--){
+      const o = obstacles[i];
+      o.mesh.position.z -= speed*dt; o.bb.setFromObject(o.mesh);
+      if (o.mesh.position.z < -30){ scene.remove(o.mesh); obstacles.splice(i,1); continue; }
+      if (o.bb.intersectsBox(playerBB)){
+        // Resolve by type
+        if (o.type==='low' && player.position.y>1.1){
+          // clean jump over
+        } else if (o.type==='high' && duckT>0){
+          // ducked under
+        } else if (o.type==='bar' && Math.abs(player.position.x - o.mesh.position.x) > 0.8){
+          // sidestepped precisely
+        } else {
+          // hit — slow player and bring yeti closer
+          speed = Math.max(BASE_SPEED*0.6, speed*0.7);
+          yetiDist = Math.max(4.5, yetiDist - 2.0);
+          score = Math.max(0, score - 25);
+          // brief knockback animation
+          player.position.z -= 0.5;
+        }
+      }
+    }
+
+    // coins
+    for (let i=coins.length-1;i>=0;i--){
+      const c = coins[i];
+      c.mesh.position.z -= speed*dt; c.t += dt*6; c.mesh.position.y = 1.1 + Math.sin(c.t)*0.15; c.bb.setFromObject(c.mesh);
+      if (c.mesh.position.z < -30){ scene.remove(c.mesh); coins.splice(i,1); continue; }
+      if (c.bb.intersectsBox(playerBB)){
+        scene.remove(c.mesh); coins.splice(i,1);
+        coinCount++; score += COIN_VALUE;
+      }
+    }
+  }
+
+  // ======= Controls =======
+  function onKey(e){
+    if (e.repeat) return;
+    if (e.key==='a' || e.key==='A' || e.key==='ArrowLeft')  tryMove(1);   // swapped: left -> +1
+    else if (e.key==='d' || e.key==='D' || e.key==='ArrowRight') tryMove(-1); // swapped: right -> -1
+    else if (e.key==='w' || e.key==='W' || e.key==='ArrowUp' || e.code==='Space') tryJump();
+    else if (e.key==='s' || e.key==='S' || e.key==='ArrowDown') tryDuck();
+    else if (e.key==='p' || e.key==='P') paused=!paused;
+    else if (!alive && e.key==='Enter'){ begin(); }
+  }
+
+  function tryMove(dir){ // -1 left, +1 right; can mid-air (side jump/roll)
+    if (!alive) return;
+    const next = THREE.MathUtils.clamp(playerLane + dir, 0, 2);
+    if (next!==playerLane){
+      playerLane = next;
+      if (player.position.y>1.02){
+        // side jump bonus visuals: quick tilt
+        player.rotation.z = THREE.MathUtils.degToRad(-10*dir);
+        setTimeout(()=> player.rotation.z=0, 120);
+      } else if (duckT>0){
+        // side roll feel: quick yaw
+        player.rotation.y = THREE.MathUtils.degToRad(15*dir);
+        setTimeout(()=> player.rotation.y=0, 120);
+      }
+    }
+  }
+  function tryJump(){ if (!alive) return; if (player.position.y<=1.02){ vy = JUMP_V; } }
+  function tryDuck(){ if (!alive) return; if (player.position.y<=1.02){ duckT = 0.5; } else { rollT = 0.4; } }
+
+  // ======= Dev Self-Tests (run once after init) =======
+  function runSelfTests(){
+    try{
+      // Ensure tryMove direction semantics match current mapping
+      const savedAlive = alive, savedLane = playerLane;
+      alive = true; playerLane = 1; player.position.y = 1.0; duckT = 0;
+      tryMove(1);   console.assert(playerLane === 2, 'tryMove(1) should move to rightmost lane from middle');
+      playerLane = 1; tryMove(-1); console.assert(playerLane === 0, 'tryMove(-1) should move to leftmost lane from middle');
+      // Restore
+      alive = savedAlive; playerLane = savedLane;
+    } catch(e){ console.warn('Self-tests failed:', e); }
+  }
+
+  // Touch (swipe)
+  function initTouch(){
+    let sx=0, sy=0, st=0; const T=30, TAP=180; const el=document.getElementById('game');
+    el.addEventListener('touchstart', e=>{const t=e.changedTouches[0]; sx=t.clientX; sy=t.clientY; st=Date.now();},{passive:true});
+    el.addEventListener('touchend', e=>{const t=e.changedTouches[0]; const dx=t.clientX-sx, dy=t.clientY-sy, dt=Date.now()-st; if(dt<TAP && Math.hypot(dx,dy)<T){ tryJump(); return } if(Math.abs(dx)>Math.abs(dy)){ if(dx>T) tryMove(-1); else if(dx<-T) tryMove(1); } else { if(dy>T) tryDuck(); else if(dy<-T) tryJump(); } },{passive:true});
+  }
+
+  // ======= Leaderboard =======
+  async function loadTop(){
+    try{
+      const r = await fetch(`${API}?action=top`);
+      const data = await r.json();
+      if (!Array.isArray(data)) return lbList.textContent = '…';
+      lbList.innerHTML = data.map((row,i)=>`${String(i+1).padStart(2,' ')}. <b>${escapeHtml(row.name||'Player')}</b> — ${row.score} pts <span style="opacity:.7">(${row.lines||row.distance||0} m)</span>`).join('<br>');
+    }catch(e){ lbList.textContent = 'Failed to load leaderboard'; }
+  }
+  async function submitTop(name, score, distance){
+    try{
+      await fetch(API, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'submit', name, score, lines: distance}) });
+    }catch(e){}
+  }
+  function escapeHtml(s){return s.replace(/[&<>"']/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+
+  // ======= Boot =======
+  init();
+  runSelfTests();
+  </script>
+</body>
+</html>
