@@ -35,6 +35,7 @@
       <div class="chip">🪙 Coins: <span id="coins">0</span></div>
       <div class="chip">⚡ Speed: <span id="speed">8</span></div>
       <div class="chip">📏 Dist: <span id="dist">0</span> m</div>
+      <div class="chip" id="powers"></div>
     </div>
     <div id="banner">⛰️ Mountain Runner 3D</div>
 
@@ -68,22 +69,28 @@
   const SPEED_RAMP = 0.015; // per second
   const COIN_VALUE = 10;
   const API = 'api.php';    // adjust path if needed
+  const POWER_DURS = {shield:8, magnet:8, boost:4, slow:3};
+  const POWER_TYPES = ['shield','magnet','boost','slow'];
 
   // ======= State =======
   let renderer, scene, camera, clock;
   let player, playerBB, playerLane=1, vy=0, duckT=0, rollT=0;
   let ground, mountains = [];
-  let obstacles = [], coins = [];
+  let obstacles = [], coins = [], powerups = [];
+  let powers = {shield:0, magnet:0, boost:0, slow:0};
   let speed = BASE_SPEED, distance=0, score=0, coinCount=0;
   let alive = false, paused = false;
   let yeti, yetiDist = 15; // behind player
   let spawnZ = 60; // where new items spawn
+  let shieldRing, magnetAura;
+  const baseFog = new THREE.Color(0x0b1022);
 
   // HUD
   const elScore = document.getElementById('score');
   const elCoins = document.getElementById('coins');
   const elSpeed = document.getElementById('speed');
   const elDist  = document.getElementById('dist');
+  const elPowers = document.getElementById('powers');
   const startBtn = document.getElementById('startBtn');
 
   // Leaderboard
@@ -186,9 +193,12 @@
     // Clear items
     obstacles.forEach(o=>scene.remove(o.mesh)); obstacles=[];
     coins.forEach(c=>scene.remove(c.mesh)); coins=[];
+    powerups.forEach(p=>scene.remove(p.mesh)); powerups=[];
+    for (const k in powers) deactivatePower(k);
 
     playerLane=1; vy=0; duckT=0; rollT=0; speed=BASE_SPEED; distance=0; score=0; coinCount=0; yetiDist=15; spawnZ=60;
     player.position.set(LANES[playerLane], 1.0, -2);
+    player.scale.set(1,1,1);
   }
 
   // ======= Loop =======
@@ -196,9 +206,18 @@
     if (!alive) return;
     const dt = Math.min(0.033, clock.getDelta());
     if (!paused){
+      // power timers
+      for (const k in powers){
+        if (powers[k]>0){ powers[k]-=dt; if (powers[k]<=0) deactivatePower(k); }
+      }
+
       // Speed ramp
       speed = Math.min(MAX_SPEED, speed + SPEED_RAMP*dt*60);
-      distance += speed*dt; score += speed*dt * 5; // running gives points
+      let curSpeed = speed;
+      if (powers.boost>0) curSpeed = Math.min(MAX_SPEED, speed*1.5);
+      let worldSpeed = curSpeed;
+      if (powers.slow>0) worldSpeed *= 0.5;
+      distance += curSpeed*dt; score += curSpeed*dt * 5; // running gives points
 
       // Lane smoothing toward target x (snap instantly for simplicity here)
       const targetX = LANES[playerLane];
@@ -213,20 +232,22 @@
       if (duckT>0) duckT -= dt; if (rollT>0) rollT -= dt;
       const scaleY = (duckT>0? 0.55 : (rollT>0? 0.75 : 1.0));
       player.scale.y += (scaleY - player.scale.y)*Math.min(1, dt*15);
+      const scaleZ = powers.boost>0?1.1 + Math.sin(clock.elapsedTime*40)*0.05:1.0;
+      player.scale.z += (scaleZ - player.scale.z)*Math.min(1, dt*10);
 
       // Move world objects toward player (negative Z)
-      ground.position.z -= speed*dt; if (ground.position.z < -100){ ground.position.z += 200; }
-      mountains.forEach(m=>{ m.position.z -= speed*dt*0.6; if (m.position.z < -20) m.position.z += 200; });
+      ground.position.z -= worldSpeed*dt; if (ground.position.z < -100){ ground.position.z += 200; }
+      mountains.forEach(m=>{ m.position.z -= worldSpeed*dt*0.6; if (m.position.z < -20) m.position.z += 200; });
 
       // Spawn logic
-      spawnZ -= speed*dt;
+      spawnZ -= worldSpeed*dt;
       while (spawnZ < 80){
         spawnRow(spawnZ + 200);
         spawnZ += 20 + Math.random()*8;
       }
 
-      // Update obstacles/coins
-      updateObjects(dt);
+      // Update obstacles/coins/powerups
+      updateObjects(dt, worldSpeed);
 
       // Yeti follows (gets closer on hits in future)
       const yz = player.position.z - yetiDist;
@@ -240,8 +261,15 @@
       // HUD
       elScore.textContent = Math.round(score);
       elCoins.textContent = coinCount;
-      elSpeed.textContent = speed.toFixed(1);
+      elSpeed.textContent = curSpeed.toFixed(1);
       elDist.textContent  = Math.round(distance);
+      let pTxt='';
+      if(powers.shield>0) pTxt+=`🛡 ${Math.ceil(powers.shield)}s `;
+      if(powers.magnet>0) pTxt+=`🧲 ${Math.ceil(powers.magnet)}s `;
+      if(powers.boost>0) pTxt+=`🚀 ${Math.ceil(powers.boost)}s `;
+      if(powers.slow>0) pTxt+=`🐌 ${Math.ceil(powers.slow)}s `;
+      elPowers.textContent = pTxt.trim();
+      elPowers.style.display = pTxt? 'block':'none';
     }
     render();
     requestAnimationFrame(animate);
@@ -253,8 +281,14 @@
   function spawnRow(z){
     // Random: obstacles or coins per lane
     const pattern = Math.random();
+    let spawnedPower = false;
     for (let lane=0; lane<3; lane++){
       const x = LANES[lane];
+      if (!spawnedPower && Math.random() < 0.03){
+        spawnPowerUp(x, z);
+        spawnedPower = true;
+        continue;
+      }
       if (pattern < 0.55){
         // obstacle types
         const r = Math.random();
@@ -284,14 +318,23 @@
     coins.push({mesh, bb:new THREE.Box3(), t:Math.random()*Math.PI*2});
   }
 
-  function updateObjects(dt){
+  function spawnPowerUp(x, z){
+    const type = POWER_TYPES[Math.floor(Math.random()*POWER_TYPES.length)];
+    const mat = new THREE.MeshStandardMaterial({color:{shield:0x3b82f6, magnet:0xfbbf24, boost:0x22c55e, slow:0xa855f7}[type]});
+    const geo = new THREE.OctahedronGeometry(0.6);
+    const mesh = new THREE.Mesh(geo, mat); mesh.position.set(x,1.2,z);
+    scene.add(mesh);
+    powerups.push({mesh,type,bb:new THREE.Box3()});
+  }
+
+  function updateObjects(dt, ws){
     // move and check collisions
     playerBB.setFromObject(player);
 
     // obstacles
     for (let i=obstacles.length-1;i>=0;i--){
       const o = obstacles[i];
-      o.mesh.position.z -= speed*dt; o.bb.setFromObject(o.mesh);
+      o.mesh.position.z -= ws*dt; o.bb.setFromObject(o.mesh);
       if (o.mesh.position.z < -30){ scene.remove(o.mesh); obstacles.splice(i,1); continue; }
       if (o.bb.intersectsBox(playerBB)){
         // Resolve by type
@@ -302,12 +345,16 @@
         } else if (o.type==='bar' && Math.abs(player.position.x - o.mesh.position.x) > 0.8){
           // sidestepped precisely
         } else {
-          // hit — slow player and bring yeti closer
-          speed = Math.max(BASE_SPEED*0.6, speed*0.7);
-          yetiDist = Math.max(4.5, yetiDist - 2.0);
-          score = Math.max(0, score - 25);
-          // brief knockback animation
-          player.position.z -= 0.5;
+          if (powers.shield>0){
+            deactivatePower('shield');
+          } else {
+            // hit — slow player and bring yeti closer
+            speed = Math.max(BASE_SPEED*0.6, speed*0.7);
+            yetiDist = Math.max(4.5, yetiDist - 2.0);
+            score = Math.max(0, score - 25);
+            // brief knockback animation
+            player.position.z -= 0.5;
+          }
         }
       }
     }
@@ -315,13 +362,56 @@
     // coins
     for (let i=coins.length-1;i>=0;i--){
       const c = coins[i];
-      c.mesh.position.z -= speed*dt; c.t += dt*6; c.mesh.position.y = 1.1 + Math.sin(c.t)*0.15; c.bb.setFromObject(c.mesh);
+      c.mesh.position.z -= ws*dt; c.t += dt*6; c.mesh.position.y = 1.1 + Math.sin(c.t)*0.15; c.bb.setFromObject(c.mesh);
+      if (powers.magnet>0){
+        const d = c.mesh.position.distanceTo(player.position);
+        if (d < 3) c.mesh.position.lerp(player.position, 0.2);
+      }
       if (c.mesh.position.z < -30){ scene.remove(c.mesh); coins.splice(i,1); continue; }
       if (c.bb.intersectsBox(playerBB)){
         scene.remove(c.mesh); coins.splice(i,1);
         coinCount++; score += COIN_VALUE;
       }
     }
+
+    // powerups
+    for (let i=powerups.length-1;i>=0;i--){
+      const p = powerups[i];
+      p.mesh.position.z -= ws*dt; p.bb.setFromObject(p.mesh);
+      if (p.mesh.position.z < -30){ scene.remove(p.mesh); powerups.splice(i,1); continue; }
+      if (p.bb.intersectsBox(playerBB)){
+        scene.remove(p.mesh); powerups.splice(i,1);
+        activatePower(p.type);
+      }
+    }
+  }
+
+  function activatePower(type){
+    powers[type] = POWER_DURS[type];
+    if (type==='shield'){
+      if (!shieldRing){
+        const rg = new THREE.RingGeometry(0.9,1.2,16);
+        const rm = new THREE.MeshBasicMaterial({color:0x3b82f6, transparent:true, opacity:0.6, side:THREE.DoubleSide});
+        shieldRing = new THREE.Mesh(rg, rm); shieldRing.rotation.x = Math.PI/2; shieldRing.position.y = 1;
+      }
+      player.add(shieldRing);
+    } else if (type==='magnet'){
+      if (!magnetAura){
+        const sg = new THREE.SphereGeometry(1.8,16,16);
+        const sm = new THREE.MeshBasicMaterial({color:0xfbbf24, transparent:true, opacity:0.15});
+        magnetAura = new THREE.Mesh(sg, sm);
+      }
+      player.add(magnetAura);
+    } else if (type==='slow'){
+      scene.fog.color.set(0x445062);
+    }
+  }
+
+  function deactivatePower(type){
+    powers[type]=0;
+    if (type==='shield' && shieldRing && shieldRing.parent) player.remove(shieldRing);
+    if (type==='magnet' && magnetAura && magnetAura.parent) player.remove(magnetAura);
+    if (type==='slow') scene.fog.color.copy(baseFog);
   }
 
   // ======= Controls =======
